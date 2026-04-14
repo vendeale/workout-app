@@ -1,5 +1,5 @@
 import streamlit as st
-from st_gsheets_connection import GSheetsConnection  # <--- Modifica questa riga
+from st_gsheets_connection import GSheetsConnection
 import pandas as pd
 
 # 1. Configurazione della pagina (Titolo e Icona nella scheda del browser)
