@@ -1,11 +1,6 @@
 import streamlit as st
 import pandas as pd
-
-# Protezione per l'importazione del connettore
-try:
-    from st_gsheets_connection import GSheetsConnection
-except ImportError:
-    from streamlit_gsheetsconnection import GSheetsConnection
+from st_gsheets_connection import GSheetsConnection
 
 # 1. Configurazione della pagina
 st.set_page_config(page_title="Workout Cloud Manager", page_icon="🏋️‍♂️", layout="wide")
