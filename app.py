@@ -1,31 +1,1494 @@
+import os
+import time
+import logging
 import streamlit as st
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta
+from fpdf import FPDF
 
-st.set_page_config(page_title="Workout Cloud Manager", page_icon="🏋️‍♂️", layout="wide")
-st.title("🏋️‍♂️ Registro Allenamenti Condiviso")
+# ---------------------------------------------------------------------------
+# CONFIGURAZIONE LOGGING
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- CONFIGURAZIONE ---
-# Incolla qui il link che hai ottenuto dalla "Pubblicazione sul Web"
-CSV_URL = "IL_TUO_LINK_CSV_PUBBLICATO_QUI"
+# ---------------------------------------------------------------------------
+# CONFIGURAZIONE PAGINA
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Aquatime Workout Manager",
+    page_icon="🚴‍♂️",
+    layout="wide"
+)
 
-def load_data():
-    # Aggiungiamo un parametro casuale per evitare la cache del browser
-    return pd.read_csv(f"{CSV_URL}")
+# ---------------------------------------------------------------------------
+# COSTANTI — WORKOUT
+# ---------------------------------------------------------------------------
+ID_FOGLIO           = st.secrets["ID_FOGLIO"]
+COLONNE_NASCOSTE    = ["FREQUENZA", "CARDIACA", "FC", "NASCITA", "DT"]
+GOOGLE_SHEET_OFFSET = 2
+CACHE_TTL           = 600
+CLIENT_TTL          = 3000
+MAX_PDF_PROG_LEN    = 22
+MAX_PDF_LIV_LEN     = 20
+MAX_INPUT_LEN       = 100
 
-try:
-    df = load_data()
-    
-    tab1, tab2 = st.tabs(["➕ Visualizza Dati", "📊 Analisi"])
+COL_KEYWORDS: dict = {
+    "KMH":       lambda c: "KM/H" in c or "VELOCIT" in c,
+    "KM":        lambda c: ("KM" in c and "KM/H" not in c and "VELOCIT" not in c) or "DISTANZA" in c,
+    "DATA":      lambda c: "DATA" in c and "NASCITA" not in c,
+    "CALORIE":   lambda c: "CAL" in c or "KCAL" in c,
+    "PROGRAMMA": lambda c: "PROGR" in c,
+    "LIVELLO":   lambda c: "LIV" in c,
+    "TEMP":      lambda c: "TEMP" in c,
+}
 
-    with tab1:
-        st.subheader("Dati dal Cloud (Sola Lettura via CSV)")
-        st.dataframe(df, use_container_width=True)
-        if st.button("Aggiorna"):
+# ---------------------------------------------------------------------------
+# COSTANTI — QUADRATURA CASSA
+# ---------------------------------------------------------------------------
+QUADRATURE_SHEET_NAME = "Quadrature"
+QUADRATURE_HEADERS = [
+    "Data", "Sede", "Operatore",
+    # Scontrini fiscali (input)
+    "Sc_Bancomat", "Sc_Visa", "Sc_Mastercard", "Sc_Contanti",
+    "Sc_Bonifico", "Sc_Assegno", "Sc_Groupon", "Sc_Gympass",
+    "Sc_Amex", "Sc_Altro", "Sc_Altro_Desc",
+    "Tot_Scontrini",
+    # Fatture (input)
+    "Ft_Bancomat", "Ft_Visa", "Ft_Mastercard", "Ft_Contanti",
+    "Ft_Bonifico", "Ft_Assegno", "Ft_Groupon", "Ft_Fitprime",
+    "Ft_Amex", "Ft_Aquatime", "Ft_Altro", "Ft_Altro_Desc",
+    "Tot_Fatture",
+    # Totale generale
+    "Tot_Generale",
+    # Sospeso e riconciliazione Booker
+    "Sospeso", "Sospeso_Booker",
+    # Altri servizi/fatture
+    "AS_Altro", "AS_Aquatime", "AS_Totale",
+    # Saldo cassa
+    "Saldo_Iniziale", "Incasso_Contanti",
+    "Pag1", "Note_Pag1", "Pag2", "Note_Pag2", "Pag3", "Note_Pag3",
+    "Versamento_Banca", "Prelievo_Admin",
+    "Saldo_Finale",
+    "Note",
+]
+
+# ---------------------------------------------------------------------------
+# AUTENTICAZIONE OPZIONALE
+# ---------------------------------------------------------------------------
+def check_auth() -> None:
+    if "app_password" not in st.secrets:
+        return
+    if not st.session_state.get("authenticated", False):
+        st.title("🔐 Aquatime — Accesso riservato")
+        pwd = st.text_input("Password", type="password")
+        if st.button("Accedi"):
+            if pwd == st.secrets["app_password"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Password errata")
+        st.stop()
+
+# ---------------------------------------------------------------------------
+# SICUREZZA INPUT
+# ---------------------------------------------------------------------------
+def sanifica(val: str) -> str:
+    val = str(val).strip()[:MAX_INPUT_LEN]
+    if val and val[0] in ("=", "+", "-", "@", "|", "%"):
+        return "'" + val
+    return val
+
+# ---------------------------------------------------------------------------
+# ACCESSO AI DATI — WORKOUT
+# ---------------------------------------------------------------------------
+@st.cache_resource(ttl=CLIENT_TTL)
+def get_gspread_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds)
+
+
+@st.cache_resource(ttl=CLIENT_TTL)
+def get_sheet():
+    return get_gspread_client().open_by_key(ID_FOGLIO).sheet1
+
+
+@st.cache_resource(ttl=CLIENT_TTL)
+def get_spreadsheet():
+    """Oggetto spreadsheet cachato — evita di riaprirlo ad ogni chiamata."""
+    return get_gspread_client().open_by_key(ID_FOGLIO)
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_all_data(id_foglio: str) -> list[dict]:
+    client = get_gspread_client()
+    sheet  = client.open_by_key(id_foglio).sheet1
+    data   = sheet.get_all_records(numericise_ignore=['all'])
+    result = []
+    for i, row in enumerate(data):
+        clean = {str(k).strip(): v for k, v in row.items()}
+        clean["GOOGLE_SHEET_ROW"] = i + GOOGLE_SHEET_OFFSET
+        if clean.get("Nome") and str(clean["Nome"]).strip():
+            result.append(clean)
+    return result
+
+# ---------------------------------------------------------------------------
+# ACCESSO AI DATI — QUADRATURA CASSA
+# ---------------------------------------------------------------------------
+def get_or_create_quadrature_sheet() -> gspread.Worksheet:
+    """
+    Restituisce il tab 'Quadrature'. Se non esiste lo crea con le intestazioni.
+    Usa get_spreadsheet() cachato per evitare chiamate API ridondanti.
+    """
+    spreadsheet = get_spreadsheet()
+    try:
+        ws = spreadsheet.worksheet(QUADRATURE_SHEET_NAME)
+        # Verifica che le intestazioni esistano
+        if not ws.row_values(1):
+            ws.append_row(QUADRATURE_HEADERS)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(
+            title=QUADRATURE_SHEET_NAME,
+            rows=2000,
+            cols=len(QUADRATURE_HEADERS)
+        )
+        ws.append_row(QUADRATURE_HEADERS)
+        logger.info("Creato tab '%s'", QUADRATURE_SHEET_NAME)
+    return ws
+
+
+def get_last_saldo_iniziale(sede: str) -> float:
+    """
+    Recupera l'ultimo Saldo_Finale dal tab Quadrature per la sede indicata.
+    Usa fetch_quadrature_data cachato — nessuna doppia lettura API.
+    """
+    try:
+        records = fetch_quadrature_data(sede)
+        if records:
+            return force_numeric(records[-1].get("Saldo_Finale", 0))
+    except Exception as e:
+        logger.error("Errore recupero saldo iniziale: %s", e)
+    return 0.0
+
+
+@st.cache_data(ttl=60)
+def fetch_quadrature_data(sede: str) -> list[dict]:
+    """
+    Legge i record del tab Quadrature per la sede indicata.
+    Cachato 60s — breve TTL per bilanciare freschezza e performance.
+    Invalidato esplicitamente dopo ogni scrittura/cancellazione.
+    """
+    try:
+        ws = get_or_create_quadrature_sheet()
+        all_records = ws.get_all_records()
+        result = []
+        for i, r in enumerate(all_records):
+            if str(r.get("Sede", "")).strip() == sede:
+                r["SHEET_ROW"] = i + 2  # riga 1 = intestazione
+                result.append(r)
+        return result
+    except Exception as e:
+        logger.error("Errore fetch quadrature: %s", e)
+        return []
+
+# ---------------------------------------------------------------------------
+# UTILITY — WORKOUT
+# ---------------------------------------------------------------------------
+def force_numeric(val) -> float:
+    """Converte qualsiasi valore (None, stringa con virgola, numero) in float."""
+    if val is None or val == "":
+        return 0.0
+    try:
+        return float(str(val).replace(",", ".").strip())
+    except (ValueError, TypeError):
+        return 0.0
+
+# Alias breve usato nei calcoli live del form (None → 0.0)
+_nv = force_numeric
+
+
+def normalizza_numerici(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        col_up = str(col).upper().strip()
+        is_numeric_col = (
+            COL_KEYWORDS["KMH"](col_up)
+            or COL_KEYWORDS["KM"](col_up)
+            or COL_KEYWORDS["CALORIE"](col_up)
+        )
+        if is_numeric_col:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", ".", regex=False).str.strip(),
+                errors="coerce"
+            ).fillna(0.0)
+    return df
+
+
+def get_df_normalizzato(dati_raw: list[dict]) -> pd.DataFrame:
+    if "data_version" not in st.session_state:
+        st.session_state.data_version = 0
+    chiave = f"df_norm_{st.session_state.data_version}"
+    if chiave not in st.session_state:
+        st.session_state[chiave] = normalizza_numerici(pd.DataFrame(dati_raw))
+    return st.session_state[chiave].copy()
+
+
+def invalida_df_cache():
+    versione_corrente = st.session_state.get("data_version", 0)
+    chiave_vecchia = f"df_norm_{versione_corrente}"
+    if chiave_vecchia in st.session_state:
+        del st.session_state[chiave_vecchia]
+    st.session_state.data_version = versione_corrente + 1
+
+
+def filtra_privacy(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        c for c in df.columns
+        if not any(x in str(c).upper() for x in COLONNE_NASCOSTE)
+        and c != "GOOGLE_SHEET_ROW"
+    ]
+    return df[cols].dropna(how="all").copy()
+
+
+def get_exact_col(columns, target: str):
+    matcher = COL_KEYWORDS.get(target)
+    if not matcher:
+        return None
+    for col in columns:
+        if matcher(str(col).upper().strip()):
+            return col
+    return None
+
+
+def _retry(fn, *args, max_retries: int = 3, **kwargs) -> bool:
+    for attempt in range(max_retries):
+        try:
+            fn(*args, **kwargs)
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("Tentativo %d/%d fallito (%s), retry tra %ds",
+                               attempt + 1, max_retries, e, wait)
+                time.sleep(wait)
+            else:
+                logger.error("Operazione fallita dopo %d tentativi: %s", max_retries, e)
+    return False
+
+# ---------------------------------------------------------------------------
+# UTILITY — QUADRATURA CASSA
+# ---------------------------------------------------------------------------
+def calcola_quadratura(inp: dict) -> dict:
+    """
+    Replica le formule Excel del FOGLIO_CASSA_GIORNALIERO:
+      U25  = SUM(A25:T27)  → Tot_Scontrini
+      W33  = SUM(A33:V35)  → Tot_Fatture
+      AA41 = SUM(A41:Z43)  → Tot_Generale (= Tot_Scontrini + Tot_Fatture)
+      I60  = G25+G33       → Incasso_Contanti
+      I73  = I58+I60-I62-I64-I66-I68-I70 → Saldo_Finale
+    """
+    d = inp.copy()
+
+    d["Tot_Scontrini"] = round(sum([
+        d.get("Sc_Bancomat", 0.0), d.get("Sc_Visa", 0.0),
+        d.get("Sc_Mastercard", 0.0), d.get("Sc_Contanti", 0.0),
+        d.get("Sc_Bonifico", 0.0), d.get("Sc_Assegno", 0.0),
+        d.get("Sc_Groupon", 0.0), d.get("Sc_Gympass", 0.0),
+        d.get("Sc_Amex", 0.0), d.get("Sc_Altro", 0.0),
+    ]), 2)
+
+    d["Tot_Fatture"] = round(sum([
+        d.get("Ft_Bancomat", 0.0), d.get("Ft_Visa", 0.0),
+        d.get("Ft_Mastercard", 0.0), d.get("Ft_Contanti", 0.0),
+        d.get("Ft_Bonifico", 0.0), d.get("Ft_Assegno", 0.0),
+        d.get("Ft_Groupon", 0.0), d.get("Ft_Fitprime", 0.0),
+        d.get("Ft_Amex", 0.0), d.get("Ft_Aquatime", 0.0),
+        d.get("Ft_Altro", 0.0),
+    ]), 2)
+
+    d["Tot_Generale"] = round(d["Tot_Scontrini"] + d["Tot_Fatture"], 2)
+
+    # O15 = F15+K15 = Tot_Generale + Sospeso
+    d["Sospeso_Booker"] = round(d["Tot_Generale"] + d.get("Sospeso", 0.0), 2)
+
+    # E52 = A52+C52 → Totale Altri Servizi
+    d["AS_Totale"] = round(d.get("AS_Altro", 0.0) + d.get("AS_Aquatime", 0.0), 2)
+
+    # Incasso contanti = contanti scontrini + contanti fatture (cella I60 = G25+G33)
+    d["Incasso_Contanti"] = round(
+        d.get("Sc_Contanti", 0.0) + d.get("Ft_Contanti", 0.0), 2
+    )
+
+    # Saldo finale = I73 = I58 + I60 - I62 - I64 - I66 - I68 - I70
+    d["Saldo_Finale"] = round(
+        d.get("Saldo_Iniziale", 0.0)
+        + d["Incasso_Contanti"]
+        - d.get("Pag1", 0.0)
+        - d.get("Pag2", 0.0)
+        - d.get("Pag3", 0.0)
+        - d.get("Versamento_Banca", 0.0)
+        - d.get("Prelievo_Admin", 0.0),
+        2
+    )
+    return d
+
+
+
+
+def _fmt(val) -> str:
+    """
+    Formatta un valore numerico come stringa Euro per il PDF.
+    Usa force_numeric invece di float() per gestire correttamente
+    stringhe con virgola decimale (es. "550,0") che arrivano dal
+    Google Sheet e farebbero fallire float() restituendo EUR 0,00.
+    """
+    f = force_numeric(val)
+    return f"EUR {f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# ---------------------------------------------------------------------------
+# GENERAZIONE PDF — WORKOUT
+# ---------------------------------------------------------------------------
+def generate_pdf(df_atleta: pd.DataFrame, nome_atleta: str) -> bytes | None:
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        cols   = df_atleta.columns.tolist()
+        c_data = get_exact_col(cols, "DATA")
+        c_km   = get_exact_col(cols, "KM")
+        c_kmh  = get_exact_col(cols, "KMH")
+        c_cal  = get_exact_col(cols, "CALORIE")
+        c_prog = get_exact_col(cols, "PROGRAMMA")
+        c_liv  = get_exact_col(cols, "LIVELLO")
+
+        km_vals = pd.to_numeric(df_atleta[c_km].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0.0) if c_km else pd.Series([0.0])
+        kmh_avg = df_atleta[c_kmh].apply(force_numeric).mean() if c_kmh else 0.0
+        cal_avg = df_atleta[c_cal].apply(force_numeric).mean() if c_cal else 0.0
+
+        pdf.set_fill_color(0, 80, 158)
+        pdf.rect(0, 0, 210, 40, "F")
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("helvetica", "B", 20)
+        pdf.set_y(12)
+        pdf.cell(0, 10, "AQUATIME PERFORMANCE", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("helvetica", "", 12)
+        pdf.cell(0, 10, f"REPORT: {nome_atleta.upper()}", align="C", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_y(45)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_fill_color(235, 235, 235)
+        pdf.cell(63, 10, f"KM TOTALI: {km_vals.sum():.2f}", 1, 0, "C", True)
+        pdf.cell(63, 10, f"KM/H MEDI: {kmh_avg:.1f}",       1, 0, "C", True)
+        pdf.cell(64, 10, f"KCAL MEDIE: {cal_avg:.0f}",      1, 1, "C", True)
+        pdf.ln(5)
+
+        # Larghezze: 22+35+30+13+13+17+15+35 = 180mm (entro margini A4)
+        col_widths = [22, 35, 30, 13, 13, 17, 15, 35]
+        headers    = ["Data", "Programma", "Livello", "Km", "Km/h", "Cal.", "T.C", "Note"]
+        pdf.set_font("helvetica", "B", 9)
+        pdf.set_fill_color(0, 80, 158)
+        pdf.set_text_color(255, 255, 255)
+        for w, h in zip(col_widths, headers):
+            pdf.cell(w, 8, h, 1, 0, "C", True)
+        pdf.ln()
+
+        # Trova colonne Note e Temperatura
+        c_note = next(
+            (c for c in cols if str(c).strip().upper() == "NOTE"), None
+        )
+        c_temp = get_exact_col(cols, "TEMP")
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("helvetica", "", 8)
+        for _, row in df_atleta.iterrows():
+            data_val = row.get(c_data, "")
+            if hasattr(data_val, "strftime"):
+                solo_data = data_val.strftime("%d/%m/%Y")
+            else:
+                data_str = str(data_val).split(" ")[0] if " " in str(data_val) else str(data_val)
+                try:
+                    solo_data = datetime.strptime(data_str, "%Y-%m-%d").strftime("%d/%m/%Y")
+                except ValueError:
+                    solo_data = data_str
+
+            note_val = str(row.get(c_note, ""))[:32] if c_note else ""
+            temp_val = str(row.get(c_temp, "")) if c_temp else ""
+            pdf.cell(col_widths[0], 7, solo_data,                                    1, 0, "C")
+            pdf.cell(col_widths[1], 7, str(row.get(c_prog, ""))[:MAX_PDF_PROG_LEN], 1, 0, "L")
+            pdf.cell(col_widths[2], 7, str(row.get(c_liv,  ""))[:MAX_PDF_LIV_LEN],  1, 0, "L")
+            pdf.cell(col_widths[3], 7, str(row.get(c_km,   "0")),                   1, 0, "C")
+            pdf.cell(col_widths[4], 7, str(row.get(c_kmh,  "0")),                   1, 0, "C")
+            pdf.cell(col_widths[5], 7, str(row.get(c_cal,  "0")),                   1, 0, "C")
+            pdf.cell(col_widths[6], 7, temp_val,                                     1, 0, "C")
+            pdf.cell(col_widths[7], 7, note_val,                                     1, 1, "L")
+
+        out = pdf.output()
+        return bytes(out) if isinstance(out, bytearray) else out
+
+    except Exception as e:
+        logger.error("Errore PDF workout: %s", e)
+        st.error(f"Errore generazione PDF: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
+# GENERAZIONE PDF — QUADRATURA CASSA
+# ---------------------------------------------------------------------------
+def genera_pdf_quadratura(d: dict) -> bytes | None:
+    """
+    Genera il PDF della quadratura cassa giornaliera su una pagina A4.
+    Layout a due colonne affiancate per Scontrini e Fatture,
+    seguita dalla sezione Saldo Cassa.
+    """
+    try:
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.set_auto_page_break(auto=False)
+        pdf.add_page()
+
+        BLUE  = (0, 80, 158)
+        LGRAY = (235, 235, 235)
+        DGRAY = (180, 180, 180)
+        BLACK = (0, 0, 0)
+        WHITE = (255, 255, 255)
+
+        LM = 8    # left margin
+        PW = 194  # page width usable (210 - 2*8)
+        CW = 95   # column width for left/right panels
+
+        # ── HEADER ─────────────────────────────────────────────────────────
+        pdf.set_fill_color(*BLUE)
+        pdf.rect(0, 0, 210, 18, "F")
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("helvetica", "B", 14)
+        pdf.set_xy(LM, 3)
+        pdf.cell(PW, 7, "AQUATIME ROMA - QUADRATURA CASSA GIORNALIERA", align="C")
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_xy(LM, 11)
+        pdf.cell(PW, 5, f"SEDE: {d.get('Sede','').upper()}", align="C")
+
+        # ── INFO ROW ───────────────────────────────────────────────────────
+        pdf.set_text_color(*BLACK)
+        pdf.set_fill_color(*LGRAY)
+        pdf.set_font("helvetica", "B", 9)
+        pdf.set_xy(LM, 21)
+        pdf.cell(40, 7, "DATA:", 1, 0, "L", True)
+        pdf.set_font("helvetica", "", 9)
+        pdf.cell(55, 7, str(d.get("Data", "")), 1, 0, "L")
+        pdf.set_font("helvetica", "B", 9)
+        pdf.cell(35, 7, "OPERATORE:", 1, 0, "L", True)
+        pdf.set_font("helvetica", "", 9)
+        pdf.cell(PW - 40 - 55 - 35, 7, str(d.get("Operatore", "")), 1, 1, "L")
+
+        y_after_info = pdf.get_y() + 3
+
+        # ── Helper: sezione bicolonna ───────────────────────────────────────
+        def section_header(title: str, x: float, y: float, w: float):
+            pdf.set_xy(x, y)
+            pdf.set_fill_color(*BLUE)
+            pdf.set_text_color(*WHITE)
+            pdf.set_font("helvetica", "B", 8)
+            pdf.cell(w, 6, title, 1, 0, "C", True)
+            pdf.set_text_color(*BLACK)
+
+        def payment_row(label: str, val: float, x: float, y: float,
+                        lw: float = 52, vw: float = 43, fill: bool = False):
+            pdf.set_xy(x, y)
+            pdf.set_fill_color(*LGRAY)
+            pdf.set_font("helvetica", "", 7)
+            pdf.cell(lw, 5.5, label, 1, 0, "L", fill)
+            pdf.set_font("helvetica", "B" if fill else "", 7)
+            pdf.cell(vw, 5.5, _fmt(val), 1, 0, "R", fill)
+
+        # ── SCONTRINI FISCALI (colonna sinistra) ───────────────────────────
+        x_left  = LM
+        x_right = LM + CW + 4
+        y_cur   = y_after_info
+
+        section_header("SCONTRINI FISCALI", x_left, y_cur, CW)
+        section_header("FATTURE",           x_right, y_cur, CW)
+        y_cur += 6
+
+        scontrini_rows = [
+            ("Bancomat",    d.get("Sc_Bancomat",   0.0)),
+            ("Visa",        d.get("Sc_Visa",        0.0)),
+            ("Mastercard",  d.get("Sc_Mastercard",  0.0)),
+            ("Contanti",    d.get("Sc_Contanti",    0.0)),
+            ("Bonifico",    d.get("Sc_Bonifico",    0.0)),
+            ("Assegno",     d.get("Sc_Assegno",     0.0)),
+            ("Groupon",     d.get("Sc_Groupon",     0.0)),
+            ("Gympass",     d.get("Sc_Gympass",     0.0)),
+            ("Amex",        d.get("Sc_Amex",        0.0)),
+            (f"Altro ({d.get('Sc_Altro_Desc','')[:12]})",
+                            d.get("Sc_Altro",       0.0)),
+        ]
+        fatture_rows = [
+            ("Bancomat",    d.get("Ft_Bancomat",    0.0)),
+            ("Visa",        d.get("Ft_Visa",        0.0)),
+            ("Mastercard",  d.get("Ft_Mastercard",  0.0)),
+            ("Contanti",    d.get("Ft_Contanti",    0.0)),
+            ("Bonifico",    d.get("Ft_Bonifico",    0.0)),
+            ("Assegno",     d.get("Ft_Assegno",     0.0)),
+            ("Groupon",     d.get("Ft_Groupon",     0.0)),
+            ("Fitprime",    d.get("Ft_Fitprime",    0.0)),
+            ("Amex",        d.get("Ft_Amex",        0.0)),
+            ("Aquatime P/T",d.get("Ft_Aquatime",    0.0)),
+            (f"Altro ({d.get('Ft_Altro_Desc','')[:12]})",
+                            d.get("Ft_Altro",       0.0)),
+        ]
+
+        max_rows = max(len(scontrini_rows), len(fatture_rows))
+        for i in range(max_rows):
+            if i < len(scontrini_rows):
+                payment_row(scontrini_rows[i][0], scontrini_rows[i][1], x_left, y_cur)
+            if i < len(fatture_rows):
+                payment_row(fatture_rows[i][0], fatture_rows[i][1], x_right, y_cur)
+            y_cur += 5.5
+
+        # Totali sezione
+        payment_row("TOTALE SCONTRINI", d["Tot_Scontrini"], x_left,  y_cur, fill=True)
+        payment_row("TOTALE FATTURE",   d["Tot_Fatture"],   x_right, y_cur, fill=True)
+        y_cur += 5.5 + 4
+
+        # ── TOTALE GENERALE ────────────────────────────────────────────────
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*BLUE)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("helvetica", "B", 10)
+        pdf.cell(130, 8, "TOTALE GENERALE (Scontrini + Fatture)", 1, 0, "L", True)
+        pdf.cell(PW - 130, 8, _fmt(d["Tot_Generale"]), 1, 1, "R", True)
+        pdf.set_text_color(*BLACK)
+        y_cur = pdf.get_y() + 3
+
+        # ── SOSPESO E RICONCILIAZIONE BOOKER ───────────────────────────────
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*LGRAY)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(PW, 5, "RICONCILIAZIONE BOOKER", 1, 1, "C", True)
+        y_cur = pdf.get_y()
+
+        LW2 = 130
+        VW2 = PW - LW2
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*WHITE)
+        pdf.set_font("helvetica", "", 8)
+        pdf.cell(LW2, 6, "Totale Booker (= Totale Generale)", 1, 0, "L", False)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(VW2, 6, _fmt(d["Tot_Generale"]), 1, 1, "R", False)
+        y_cur = pdf.get_y()
+
+        pdf.set_xy(LM, y_cur)
+        pdf.set_font("helvetica", "", 8)
+        pdf.cell(LW2, 6, "Sospeso (K15)", 1, 0, "L", False)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(VW2, 6, _fmt(d.get("Sospeso", 0.0)), 1, 1, "R", False)
+        y_cur = pdf.get_y()
+
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*LGRAY)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(LW2, 6, "Sospeso + Totale Booker (O15)", 1, 0, "L", True)
+        pdf.cell(VW2, 6, _fmt(d["Sospeso_Booker"]), 1, 1, "R", True)
+        pdf.set_text_color(*BLACK)
+        y_cur = pdf.get_y() + 3
+
+        # ── ALTRI SERVIZI / FATTURE ─────────────────────────────────────────
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*LGRAY)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(PW, 5, "ALTRI SERVIZI / FATTURE", 1, 1, "C", True)
+        y_cur = pdf.get_y()
+
+        as_col = PW / 3
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*BLUE)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("helvetica", "B", 7)
+        pdf.cell(as_col, 5.5, "ALTRO", 1, 0, "C", True)
+        pdf.cell(as_col, 5.5, "AQUATIME", 1, 0, "C", True)
+        pdf.cell(as_col, 5.5, "TOTALE", 1, 1, "C", True)
+        pdf.set_text_color(*BLACK)
+        y_cur = pdf.get_y()
+
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*WHITE)
+        pdf.set_font("helvetica", "", 8)
+        pdf.cell(as_col, 6, _fmt(d.get("AS_Altro", 0.0)),   1, 0, "C", False)
+        pdf.cell(as_col, 6, _fmt(d.get("AS_Aquatime", 0.0)),1, 0, "C", False)
+        pdf.set_font("helvetica", "B", 8)
+        pdf.cell(as_col, 6, _fmt(d.get("AS_Totale", 0.0)),  1, 1, "C", False)
+        y_cur = pdf.get_y() + 3
+
+        # ── SALDO CASSA CONTANTI ───────────────────────────────────────────
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*BLUE)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("helvetica", "B", 9)
+        pdf.cell(PW, 6, "SALDO CASSA CONTANTI", 1, 1, "C", True)
+        pdf.set_text_color(*BLACK)
+        y_cur = pdf.get_y()
+
+        LW_SALDO = 110  # label width
+        VW_SALDO = PW - LW_SALDO  # value width
+
+        def saldo_row(label: str, val, bold_val: bool = False,
+                      fill_color=None, text_color=BLACK):
+            nonlocal y_cur
+            fc = fill_color if fill_color else WHITE
+            pdf.set_xy(LM, y_cur)
+            pdf.set_fill_color(*fc)
+            pdf.set_font("helvetica", "", 8)
+            pdf.cell(LW_SALDO, 6.5, label, 1, 0, "L", True)
+            pdf.set_font("helvetica", "B" if bold_val else "", 8)
+            pdf.set_text_color(*text_color)
+            pdf.cell(VW_SALDO, 6.5, _fmt(val), 1, 1, "R", True)
+            pdf.set_text_color(*BLACK)
+            y_cur += 6.5
+
+        saldo_row("Saldo Iniziale Cassa Contanti",         d.get("Saldo_Iniziale",    0.0), fill_color=LGRAY)
+        saldo_row("(+) Incasso Contanti del giorno",       d.get("Incasso_Contanti",  0.0))
+        note1 = f"(-) Pagamento 1 - {d.get('Note_Pag1','')[:30]}" if d.get("Note_Pag1") else "(-) Pagamento 1"
+        note2 = f"(-) Pagamento 2 - {d.get('Note_Pag2','')[:30]}" if d.get("Note_Pag2") else "(-) Pagamento 2"
+        note3 = f"(-) Pagamento 3 - {d.get('Note_Pag3','')[:30]}" if d.get("Note_Pag3") else "(-) Pagamento 3"
+        saldo_row(note1,                                   d.get("Pag1",              0.0))
+        saldo_row(note2,                                   d.get("Pag2",              0.0))
+        saldo_row(note3,                                   d.get("Pag3",              0.0))
+        saldo_row("(-) Versamento in Banca",               d.get("Versamento_Banca",  0.0))
+        saldo_row("(-) Prelievo Amministratore",           d.get("Prelievo_Admin",    0.0))
+
+        # Saldo Finale — riga evidenziata
+        pdf.set_xy(LM, y_cur)
+        pdf.set_fill_color(*BLUE)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("helvetica", "B", 10)
+        pdf.cell(LW_SALDO, 8, "SALDO FINALE CASSA CONTANTI", 1, 0, "L", True)
+        pdf.cell(VW_SALDO, 8, _fmt(d["Saldo_Finale"]), 1, 1, "R", True)
+        y_cur = pdf.get_y() + 4
+
+        # ── NOTE ───────────────────────────────────────────────────────
+        nota = str(d.get("Note", "")).strip()
+        if nota:
+            pdf.set_xy(LM, y_cur)
+            pdf.set_fill_color(*LGRAY)
+            pdf.set_text_color(*BLACK)
+            pdf.set_font("helvetica", "B", 8)
+            pdf.cell(PW, 5, "NOTE", 1, 1, "L", True)
+            y_cur = pdf.get_y()
+            pdf.set_xy(LM, y_cur)
+            pdf.set_fill_color(*WHITE)
+            pdf.set_font("helvetica", "", 8)
+            pdf.multi_cell(PW, 5, nota, border=1, align="L")
+
+        out = pdf.output()
+        return bytes(out) if isinstance(out, bytearray) else out
+
+    except Exception as e:
+        logger.error("Errore PDF quadratura: %s", e)
+        st.error(f"Errore generazione PDF quadratura: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
+# FORM QUADRATURA CASSA
+# ---------------------------------------------------------------------------
+def render_form_quadratura(sede: str) -> None:
+    """Pagina quadratura cassa con tab: Nuova / Cerca / Rivedi."""
+
+    if st.button("← Torna alla Home"):
+        # Pulisce le chiavi di conferma cancellazione orfane
+        for k in list(st.session_state.keys()):
+            if k.startswith("confirm_del_"):
+                del st.session_state[k]
+        st.session_state.pagina = "home"
+        st.rerun()
+
+    st.subheader(f"📋 Quadratura Cassa — {sede}")
+
+    tab_nuova, tab_cerca, tab_rivedi = st.tabs([
+        "➕ Nuova Quadratura",
+        "🔍 Cerca per Giorno",
+        "📋 Rivedi / Cancella",
+    ])
+
+    # =========================================================================
+    # TAB 1 — NUOVA QUADRATURA
+    # =========================================================================
+    with tab_nuova:
+
+        if "qfid" not in st.session_state:
+            st.session_state.qfid = 0
+        qfid = st.session_state.qfid
+
+        if f"saldo_init_loaded_{sede}_{qfid}" not in st.session_state:
+            st.session_state[f"saldo_init_loaded_{sede}_{qfid}"] = get_last_saldo_iniziale(sede)
+        saldo_precedente = st.session_state[f"saldo_init_loaded_{sede}_{qfid}"]
+
+        with st.container(border=True):
+
+            # ── INTESTAZIONE ─────────────────────────────────────────────
+            st.markdown("**📅 Intestazione**")
+            c1, c2 = st.columns(2)
+            data_q = c1.date_input("Data *", value=datetime.today(), format="DD/MM/YYYY",
+                                   key=f"qdata_{qfid}")
+            OPERATORI = [
+                "Barbara Iorio", "Barbara Pasqualini", "Daniela Bissieres",
+                "Francesca Ionta", "Jacopo Vendetti", "Raffaele Picinni",
+                "Stefano Lampis", "Sofia Amore",
+                "Gianluca Nania", "Altro..."
+            ]
+            op_sel = c2.selectbox("Operatore *", OPERATORI, index=None,
+                                  placeholder="Scegli operatore...", key=f"qop_sel_{qfid}")
+            operatore = ""
+            if op_sel == "Altro...":
+                operatore = st.text_input("Specificare operatore *",
+                                          key=f"qop_txt_{qfid}", max_chars=MAX_INPUT_LEN)
+            elif op_sel:
+                operatore = op_sel
+
+            st.divider()
+
+            # ── SCONTRINI FISCALI ─────────────────────────────────────────
+            st.markdown("**🧾 Scontrini Fiscali**")
+            cs1, cs2, cs3, cs4, cs5 = st.columns(5)
+            sc_bancomat  = cs1.text_input("Bancomat",   key=f"sc_bk_{qfid}", placeholder="0.00")
+            sc_visa      = cs2.text_input("Visa",       key=f"sc_vs_{qfid}", placeholder="0.00")
+            sc_master    = cs3.text_input("Mastercard", key=f"sc_mc_{qfid}", placeholder="0.00")
+            sc_contanti  = cs4.text_input("Contanti",   key=f"sc_ct_{qfid}", placeholder="0.00")
+            sc_bonifico  = cs5.text_input("Bonifico",   key=f"sc_bn_{qfid}", placeholder="0.00")
+
+            cs6, cs7, cs8, cs9, cs10 = st.columns(5)
+            sc_assegno   = cs6.text_input("Assegno",   key=f"sc_as_{qfid}", placeholder="0.00")
+            sc_groupon   = cs7.text_input("Groupon",   key=f"sc_gp_{qfid}", placeholder="0.00")
+            sc_gympass   = cs8.text_input("Gympass",   key=f"sc_gym_{qfid}", placeholder="0.00")
+            sc_amex      = cs9.text_input("Amex",      key=f"sc_amx_{qfid}", placeholder="0.00")
+            sc_altro     = cs10.text_input("Altro",    key=f"sc_alt_{qfid}", placeholder="0.00")
+            sc_altro_desc = st.text_input("Specificare Altro Scontrini",
+                                          key=f"sc_altd_{qfid}", max_chars=50)
+
+            tot_sc = round(_nv(sc_bancomat)+_nv(sc_visa)+_nv(sc_master)+_nv(sc_contanti)+_nv(sc_bonifico)+
+                           _nv(sc_assegno)+_nv(sc_groupon)+_nv(sc_gympass)+_nv(sc_amex)+_nv(sc_altro), 2)
+            st.info(f"**Totale Scontrini: {_fmt(tot_sc)}**")
+
+            st.divider()
+
+            # ── FATTURE ───────────────────────────────────────────────────
+            st.markdown("**📄 Fatture**")
+            cf1, cf2, cf3, cf4, cf5 = st.columns(5)
+            ft_bancomat  = cf1.text_input("Bancomat",    key=f"ft_bk_{qfid}", placeholder="0.00")
+            ft_visa      = cf2.text_input("Visa",        key=f"ft_vs_{qfid}", placeholder="0.00")
+            ft_master    = cf3.text_input("Mastercard",  key=f"ft_mc_{qfid}", placeholder="0.00")
+            ft_contanti  = cf4.text_input("Contanti",    key=f"ft_ct_{qfid}", placeholder="0.00")
+            ft_bonifico  = cf5.text_input("Bonifico",    key=f"ft_bn_{qfid}", placeholder="0.00")
+
+            cf6, cf7, cf8, cf9, cf10, cf11 = st.columns(6)
+            ft_assegno   = cf6.text_input("Assegno",    key=f"ft_as_{qfid}", placeholder="0.00")
+            ft_groupon   = cf7.text_input("Groupon",    key=f"ft_gp_{qfid}", placeholder="0.00")
+            ft_fitprime  = cf8.text_input("Fitprime",   key=f"ft_fp_{qfid}", placeholder="0.00")
+            ft_amex      = cf9.text_input("Amex",       key=f"ft_amx_{qfid}", placeholder="0.00")
+            ft_aquatime  = cf10.text_input("Aquatime",  key=f"ft_aq_{qfid}", placeholder="0.00")
+            ft_altro     = cf11.text_input("Altro",     key=f"ft_alt_{qfid}", placeholder="0.00")
+            ft_altro_desc = st.text_input("Specificare Altro Fatture",
+                                          key=f"ft_altd_{qfid}", max_chars=50)
+
+            tot_ft = round(_nv(ft_bancomat)+_nv(ft_visa)+_nv(ft_master)+_nv(ft_contanti)+_nv(ft_bonifico)+
+                           _nv(ft_assegno)+_nv(ft_groupon)+_nv(ft_fitprime)+_nv(ft_amex)+_nv(ft_aquatime)+_nv(ft_altro), 2)
+            st.info(f"**Totale Fatture: {_fmt(tot_ft)}**")
+
+            st.divider()
+
+            # ── SOSPESO E RICONCILIAZIONE BOOKER ─────────────────────────
+            st.markdown("**🔄 Riconciliazione Booker**")
+            tot_gen_live = round(tot_sc + tot_ft, 2)
+            rb1, rb2 = st.columns(2)
+            sospeso = rb1.text_input(
+                "Sospeso (K15)", key=f"q_sosp_{qfid}", placeholder="0.00",
+                help="Pagamenti sospesi/differiti da riconciliare con il sistema Booker"
+            )
+            sospeso_booker = round(tot_gen_live + _nv(sospeso), 2)
+            rb2.metric(
+                "Sospeso + Totale Booker (O15)",
+                _fmt(sospeso_booker),
+                help="Calcolato: Totale Generale + Sospeso (formula O15 = F15+K15)"
+            )
+
+            st.divider()
+
+            # ── ALTRI SERVIZI / FATTURE ───────────────────────────────────
+            st.markdown("**🛎️ Altri Servizi / Fatture**")
+            as1, as2, as3 = st.columns(3)
+            as_altro    = as1.text_input("Altro",    key=f"q_asa_{qfid}", placeholder="0.00")
+            as_aquatime = as2.text_input("Aquatime", key=f"q_asq_{qfid}", placeholder="0.00")
+            as_totale   = round(_nv(as_altro) + _nv(as_aquatime), 2)
+            as3.metric("Totale Altri Servizi", _fmt(as_totale))
+
+            st.divider()
+
+            # ── SALDO CASSA CONTANTI ──────────────────────────────────────
+            st.markdown("**💵 Saldo Cassa Contanti**")
+            cs_col1, cs_col2 = st.columns(2)
+            saldo_iniziale = cs_col1.text_input(
+                "Saldo Iniziale Cassa (dal giorno precedente) *",
+                value=str(saldo_precedente) if saldo_precedente else "",
+                key=f"q_siniz_{qfid}",
+                placeholder="0.00",
+                help="Pre-compilato con il saldo finale del giorno precedente. Modificabile."
+            )
+            incasso_contanti = round(_nv(sc_contanti) + _nv(ft_contanti), 2)
+            cs_col2.metric("Incasso Contanti del giorno", _fmt(incasso_contanti),
+                           help="Calcolato automaticamente: Contanti Scontrini + Contanti Fatture")
+
+            cp1, cp2, cp3 = st.columns(3)
+            pag1 = cp1.text_input("Pagamento 1 (€)", key=f"q_p1_{qfid}", placeholder="0.00")
+            pag2 = cp2.text_input("Pagamento 2 (€)", key=f"q_p2_{qfid}", placeholder="0.00")
+            pag3 = cp3.text_input("Pagamento 3 (€)", key=f"q_p3_{qfid}", placeholder="0.00")
+
+            cn1, cn2, cn3 = st.columns(3)
+            note_pag1 = cn1.text_input("Descrizione Pag. 1", key=f"q_n1_{qfid}", max_chars=50)
+            note_pag2 = cn2.text_input("Descrizione Pag. 2", key=f"q_n2_{qfid}", max_chars=50)
+            note_pag3 = cn3.text_input("Descrizione Pag. 3", key=f"q_n3_{qfid}", max_chars=50)
+
+            cv1, cv2 = st.columns(2)
+            versamento = cv1.text_input("Versamento in Banca (€)", key=f"q_vb_{qfid}", placeholder="0.00")
+            prelievo   = cv2.text_input("Prelievo Amministratore (€)", key=f"q_pa_{qfid}", placeholder="0.00")
+
+            saldo_finale = round(_nv(saldo_iniziale) + incasso_contanti
+                                 - _nv(pag1) - _nv(pag2) - _nv(pag3)
+                                 - _nv(versamento) - _nv(prelievo), 2)
+            tot_gen = round(tot_sc + tot_ft, 2)
+
+            st.divider()
+
+            # ── NOTE ──────────────────────────────────────────────────────
+            note_q = st.text_area("Note", key=f"q_note_{qfid}", max_chars=256,
+                                  placeholder="Note aggiuntive (max 256 caratteri)...")
+
+            st.divider()
+
+            # ── RIEPILOGO LIVE ────────────────────────────────────────────
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Totale Generale",      _fmt(tot_gen))
+            r2.metric("Incasso Contanti",      _fmt(incasso_contanti))
+            r3.metric("💰 Saldo Finale Cassa", _fmt(saldo_finale))
+
+            # ── PULSANTE SALVA ────────────────────────────────────────────
+            _, col_btn, _ = st.columns([2, 1, 2])
+            if col_btn.button("💾 Salva e genera PDF", use_container_width=True):
+
+                errori = []
+                if not data_q: errori.append("Data")
+                if not op_sel:
+                    errori.append("Operatore (nessuna selezione)")
+                elif op_sel == "Altro..." and not operatore:
+                    errori.append("Operatore (hai scelto 'Altro...' ma non hai specificato il nome)")
+
+                if errori:
+                    st.error(f"Compila i campi obbligatori: {', '.join(errori)}")
+                else:
+                    inp = {
+                        "Data":      data_q.strftime("%d/%m/%Y"),
+                        "Sede":      sede,
+                        "Operatore": sanifica(operatore),
+                        "Sc_Bancomat":   _nv(sc_bancomat),  "Sc_Visa":     _nv(sc_visa),
+                        "Sc_Mastercard": _nv(sc_master),    "Sc_Contanti": _nv(sc_contanti),
+                        "Sc_Bonifico":   _nv(sc_bonifico),  "Sc_Assegno":  _nv(sc_assegno),
+                        "Sc_Groupon":    _nv(sc_groupon),   "Sc_Gympass":  _nv(sc_gympass),
+                        "Sc_Amex":       _nv(sc_amex),      "Sc_Altro":    _nv(sc_altro),
+                        "Sc_Altro_Desc": sanifica(sc_altro_desc),
+                        "Ft_Bancomat":   _nv(ft_bancomat),  "Ft_Visa":     _nv(ft_visa),
+                        "Ft_Mastercard": _nv(ft_master),    "Ft_Contanti": _nv(ft_contanti),
+                        "Ft_Bonifico":   _nv(ft_bonifico),  "Ft_Assegno":  _nv(ft_assegno),
+                        "Ft_Groupon":    _nv(ft_groupon),   "Ft_Fitprime": _nv(ft_fitprime),
+                        "Ft_Amex":       _nv(ft_amex),      "Ft_Aquatime": _nv(ft_aquatime),
+                        "Ft_Altro":      _nv(ft_altro),     "Ft_Altro_Desc": sanifica(ft_altro_desc),
+                        "Sospeso":       _nv(sospeso),
+                        "AS_Altro":      _nv(as_altro),
+                        "AS_Aquatime":   _nv(as_aquatime),
+                        "Saldo_Iniziale": _nv(saldo_iniziale),
+                        "Pag1": _nv(pag1), "Note_Pag1": sanifica(note_pag1),
+                        "Pag2": _nv(pag2), "Note_Pag2": sanifica(note_pag2),
+                        "Pag3": _nv(pag3), "Note_Pag3": sanifica(note_pag3),
+                        "Versamento_Banca": _nv(versamento),
+                        "Prelievo_Admin":   _nv(prelievo),
+                        "Note": sanifica(note_q),
+                    }
+                    dati = calcola_quadratura(inp)
+
+                    with st.spinner("Salvataggio e generazione PDF in corso..."):
+                        try:
+                            ws  = get_or_create_quadrature_sheet()
+                            riga = [dati.get(col, "") for col in QUADRATURE_HEADERS]
+                            ok = _retry(ws.append_row, riga)
+
+                            if ok:
+                                pdf_bytes = genera_pdf_quadratura(dati)
+                                nome_file = (
+                                    f"{sede.replace(' ', '_')}_"
+                                    f"{data_q.strftime('%d-%m-%Y')}.pdf"
+                                )
+                                st.success("✅ Dati salvati correttamente!")
+                                if pdf_bytes:
+                                    st.download_button(
+                                        "📥 Scarica PDF Quadratura",
+                                        pdf_bytes, nome_file,
+                                        "application/pdf",
+                                        use_container_width=True
+                                    )
+                                st.session_state.qfid += 1
+                                chiave_saldo = f"saldo_init_loaded_{sede}_{qfid}"
+                                if chiave_saldo in st.session_state:
+                                    del st.session_state[chiave_saldo]
+                                # Invalida cache quadrature per questa sede
+                                fetch_quadrature_data.clear()
+                            else:
+                                st.error("❌ Salvataggio fallito. Riprova.")
+                        except Exception as e:
+                            logger.error("Errore salvataggio quadratura: %s", e)
+                            st.error(f"Errore: {e}")
+
+    # =========================================================================
+    # TAB 2 — CERCA PER GIORNO
+    # =========================================================================
+    with tab_cerca:
+        st.markdown("**Seleziona una data per cercare la quadratura di quel giorno.**")
+        data_cerca = st.date_input("Data da cercare", value=datetime.today(),
+                                   format="DD/MM/YYYY", key="qcerca_data")
+
+        if st.button("🔍 Cerca", key="btn_cerca_quad", use_container_width=False):
+            with st.spinner("Ricerca in corso..."):
+                records = fetch_quadrature_data(sede)
+                data_str = data_cerca.strftime("%d/%m/%Y")
+                trovati  = [r for r in records if str(r.get("Data", "")).strip() == data_str]
+
+            if not trovati:
+                st.warning(f"Nessuna quadratura trovata per {data_str} — {sede}.")
+            else:
+                for r in trovati:
+                    with st.container(border=True):
+                        st.markdown(f"**Data:** {r.get('Data','')} | **Operatore:** {r.get('Operatore','')} | **Sede:** {r.get('Sede','')}")
+
+                        col_a, col_b, col_c = st.columns(3)
+                        col_a.metric("Totale Scontrini", _fmt(force_numeric(r.get("Tot_Scontrini", 0))))
+                        col_b.metric("Totale Fatture",   _fmt(force_numeric(r.get("Tot_Fatture", 0))))
+                        col_c.metric("Totale Generale",  _fmt(force_numeric(r.get("Tot_Generale", 0))))
+
+                        col_d, col_e = st.columns(2)
+                        col_d.metric("Saldo Iniziale", _fmt(force_numeric(r.get("Saldo_Iniziale", 0))))
+                        col_e.metric("Saldo Finale",   _fmt(force_numeric(r.get("Saldo_Finale", 0))))
+
+                        if r.get("Note"):
+                            st.info(f"📝 Note: {r.get('Note')}")
+
+                        # Rigenera PDF
+                        pdf_bytes = genera_pdf_quadratura(r)
+                        if pdf_bytes:
+                            nome_file = (
+                                f"{sede.replace(' ', '_')}_"
+                                f"{data_cerca.strftime('%d-%m-%Y')}.pdf"
+                            )
+                            st.download_button(
+                                "📥 Scarica PDF",
+                                pdf_bytes, nome_file,
+                                "application/pdf",
+                                key=f"dl_cerca_{r.get('SHEET_ROW', 0)}",
+                                use_container_width=True
+                            )
+
+    # =========================================================================
+    # TAB 3 — RIVEDI / CANCELLA
+    # =========================================================================
+    with tab_rivedi:
+        st.markdown("**Ultimi 30 giorni di quadrature per questa sede.**")
+
+        if st.button("🔄 Aggiorna lista", key="btn_aggiorna_rivedi"):
             st.rerun()
-            
-    with tab2:
-        st.info("Nota: Per inserire dati, usa direttamente il foglio Google. Questa app li visualizzerà in tempo reale.")
+
+        with st.spinner("Caricamento..."):
+            records_tutti = fetch_quadrature_data(sede)
+
+        limite = datetime.now() - timedelta(days=30)
+        records_recenti = []
+        for r in records_tutti:
+            try:
+                d = datetime.strptime(str(r.get("Data", "")).strip(), "%d/%m/%Y")
+                if d >= limite:
+                    records_recenti.append(r)
+            except ValueError:
+                pass
+        records_recenti.sort(key=lambda x: datetime.strptime(x.get("Data","01/01/2000"), "%d/%m/%Y"), reverse=True)
+
+        if not records_recenti:
+            st.info("Nessuna quadratura negli ultimi 30 giorni.")
+        else:
+            for r in records_recenti:
+                label = f"{r.get('Data','')} — {r.get('Operatore','')} — Tot. {_fmt(force_numeric(r.get('Tot_Generale',0)))}"
+                with st.expander(label):
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Tot. Scontrini", _fmt(force_numeric(r.get("Tot_Scontrini", 0))))
+                    col_b.metric("Tot. Fatture",   _fmt(force_numeric(r.get("Tot_Fatture", 0))))
+                    col_c.metric("Tot. Generale",  _fmt(force_numeric(r.get("Tot_Generale", 0))))
+
+                    col_d, col_e = st.columns(2)
+                    col_d.metric("Saldo Iniziale", _fmt(force_numeric(r.get("Saldo_Iniziale", 0))))
+                    col_e.metric("Saldo Finale",   _fmt(force_numeric(r.get("Saldo_Finale", 0))))
+
+                    if r.get("Note"):
+                        st.info(f"📝 Note: {r.get('Note')}")
+
+                    # Download PDF
+                    pdf_bytes = genera_pdf_quadratura(r)
+                    row_id = r.get("SHEET_ROW", 0)
+                    if pdf_bytes:
+                        data_label = str(r.get("Data","")).replace("/","-")
+                        st.download_button(
+                            "📥 Scarica PDF",
+                            pdf_bytes,
+                            f"{sede.replace(' ','_')}_{data_label}.pdf",
+                            "application/pdf",
+                            key=f"dl_rivedi_{row_id}",
+                            use_container_width=True
+                        )
+
+                    # Cancellazione con doppia conferma
+                    st.warning("⚠️ Zona pericolosa — la cancellazione e' irreversibile.")
+                    key_confirm = f"confirm_del_{row_id}"
+                    if not st.session_state.get(key_confirm, False):
+                        if st.button("🗑️ Elimina questa quadratura",
+                                     key=f"btn_del1_{row_id}", use_container_width=True):
+                            st.session_state[key_confirm] = True
+                            st.rerun()
+                    else:
+                        st.error(f"Confermi l'eliminazione di **{r.get('Data','')} — {r.get('Operatore','')}**?")
+                        col_si, col_no = st.columns(2)
+                        if col_si.button("✅ Si, elimina", key=f"btn_del_ok_{row_id}",
+                                         use_container_width=True):
+                            with st.spinner("Eliminazione in corso..."):
+                                ws_del = get_or_create_quadrature_sheet()
+                                ok = _retry(ws_del.delete_rows, row_id)
+                            if ok:
+                                st.session_state[key_confirm] = False
+                                fetch_quadrature_data.clear()
+                                st.success("✅ Quadratura eliminata.")
+                                st.rerun()
+                            else:
+                                st.error("❌ Eliminazione fallita. Riprova.")
+                        if col_no.button("❌ Annulla", key=f"btn_del_no_{row_id}",
+                                         use_container_width=True):
+                            st.session_state[key_confirm] = False
+                            st.rerun()
+
+
+# ===========================================================================
+# APP PRINCIPALE
+# ===========================================================================
+check_auth()
+
+# Inizializza navigazione
+if "pagina" not in st.session_state:
+    st.session_state.pagina = "home"
+
+# ── ROUTING ────────────────────────────────────────────────────────────────
+if st.session_state.pagina in ("quad_Prati", "quad_Corso Trieste"):
+    check_auth()   # ← verifica auth anche sulle pagine interne
+    sede_attiva = "Prati" if st.session_state.pagina == "quad_Prati" else "Corso Trieste"
+    render_form_quadratura(sede_attiva)
+    st.stop()
+
+# ── HOME PAGE ──────────────────────────────────────────────────────────────
+try:
+    try:
+        dati_raw = fetch_all_data(ID_FOGLIO)
+    except Exception as e:
+        logger.error("Errore fetch dati: %s", e)
+        st.error(f"Impossibile caricare i dati dal foglio: {e}")
+        st.stop()
+
+    df_norm = get_df_normalizzato(dati_raw)
+
+    # ── 1. LOGO ──────────────────────────────────────────────────────────
+    _, c_c, _ = st.columns([1, 2, 1])
+    with c_c:
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+        else:
+            st.title("AQUATIME")
+
+    # ── 2. PULSANTI QUADRATURA CASSA ─────────────────────────────────────
+    st.divider()
+    st.subheader("📊 Quadratura Cassa Giornaliera")
+    qc1, qc2 = st.columns(2)
+    if qc1.button("🏛️ Quadratura Prati",        use_container_width=True):
+        st.session_state.pagina = "quad_Prati"
+        st.rerun()
+    if qc2.button("🏛️ Quadratura Corso Trieste", use_container_width=True):
+        st.session_state.pagina = "quad_Corso Trieste"
+        st.rerun()
+
+    # ── 3. RICERCA E REPORT PDF ──────────────────────────────────────────
+    st.divider()
+    with st.expander("🔍 **RICERCA ATLETA E REPORT PDF**", expanded=True):
+        col1, col2 = st.columns(2)
+        n_input = col1.text_input("Filtra Nome",    key="src_n", max_chars=MAX_INPUT_LEN)
+        c_input = col2.text_input("Filtra Cognome", key="src_c", max_chars=MAX_INPUT_LEN)
+
+        if (n_input or c_input) and dati_raw:
+            mask = (
+                df_norm["Nome"].astype(str).str.contains(n_input, case=False, na=False, regex=False)
+                & df_norm["Cognome"].astype(str).str.contains(c_input, case=False, na=False, regex=False)
+            )
+            res = df_norm[mask].copy()
+
+            if not res.empty:
+                c_data_col = get_exact_col(res.columns, "DATA")
+                if c_data_col:
+                    res[c_data_col] = pd.to_datetime(res[c_data_col], dayfirst=True, errors="coerce")
+                    res = res.sort_values(c_data_col, ascending=False)
+
+                df_view    = filtra_privacy(res)
+                df_display = df_view.copy()
+                if c_data_col and c_data_col in df_display.columns:
+                    df_display[c_data_col] = df_display[c_data_col].dt.strftime("%d/%m/%Y")
+
+                st.dataframe(df_display, use_container_width=True)
+
+                nome_file_pdf = f"Report_{datetime.now():%d%m%Y}_{n_input}_{c_input}.pdf".replace(" ", "_")
+                pdf_out = generate_pdf(df_view, f"{n_input} {c_input}")
+                if pdf_out:
+                    st.download_button(
+                        "📥 Scarica Report PDF", pdf_out,
+                        nome_file_pdf, "application/pdf",
+                        use_container_width=True
+                    )
+            else:
+                st.warning("Nessun atleta trovato.")
+
+    # ── 4. NUOVA SESSIONE WORKOUT ────────────────────────────────────────
+    st.divider()
+    st.subheader("📝 Nuova Sessione")
+
+    if "form_id" not in st.session_state:
+        st.session_state.form_id = 0
+    fid = st.session_state.form_id
+
+    with st.container(border=True):
+        f1, f2, f3 = st.columns(3)
+        nome_ins    = f1.text_input("Nome *",    key=f"n_{fid}", max_chars=MAX_INPUT_LEN)
+        cognome_ins = f2.text_input("Cognome *", key=f"c_{fid}", max_chars=MAX_INPUT_LEN)
+        sede_ins    = f3.selectbox(
+            "Sede *", ["Prati", "Corso Trieste"],
+            index=None, placeholder="Scegli sede...", key=f"s_{fid}"
+        )
+
+        st.write("---")
+        c1, c2, c3, c4 = st.columns(4)
+        data_s = c1.date_input("Data *", value=None, format="DD/MM/YYYY", key=f"d_{fid}")
+
+        dur_sel  = c2.selectbox(
+            "Sessione *", ["30 min", "45 min", "Altro..."],
+            index=None, key=f"dur_{fid}"
+        )
+        f_durata = c2.text_input(
+            "Specifica Sessione", key=f"dura_{fid}", max_chars=MAX_INPUT_LEN
+        ) if dur_sel == "Altro..." else dur_sel
+
+        prg_sel = c3.selectbox(
+            "Programma *", ["Forma", "Expert", "Sportivo", "Salute", "Manuale", "Altro..."],
+            index=None, key=f"prg_{fid}"
+        )
+        f_prog  = c3.text_input(
+            "Specifica Programma", key=f"prga_{fid}", max_chars=MAX_INPUT_LEN
+        ) if prg_sel == "Altro..." else prg_sel
+
+        liv_sel = c4.selectbox(
+            "Livello *",
+            ["1-resistenza","2-resistenza","3-resistenza",
+             "1-variabile","2-variabile","3-variabile",
+             "4-variabile","5-variabile","6-variabile","Altro..."],
+            index=None, key=f"liv_{fid}"
+        )
+        f_liv   = c4.text_input(
+            "Specifica Livello", key=f"liva_{fid}", max_chars=MAX_INPUT_LEN
+        ) if liv_sel == "Altro..." else liv_sel
+
+        st.write("---")
+        f8, f9, f10, f11 = st.columns(4)
+        vel_str  = f8.text_input("Km/h *",             key=f"v_{fid}",    placeholder="es. 18.5")
+        dist_str = f9.text_input("Km *",               key=f"dist_{fid}", placeholder="es. 12.3")
+        cal_str  = f10.text_input("Calorie *",         key=f"cal_{fid}",  placeholder="es. 450")
+        temp_str = f11.text_input("Temp. Acqua (C)",  key=f"temp_{fid}", placeholder="es. 28 (opzionale)")
+        vel  = force_numeric(vel_str)  if (vel_str or "").strip()  else None
+        dist = force_numeric(dist_str) if (dist_str or "").strip() else None
+        cal  = force_numeric(cal_str)  if (cal_str or "").strip()  else None
+        temp = force_numeric(temp_str) if (temp_str or "").strip() else None
+
+        note_ins = st.text_area("Note", key=f"note_{fid}", max_chars=256,
+                               placeholder="Note aggiuntive (max 256 caratteri)...")
+
+        _, col_btn, _ = st.columns([2, 1, 2])
+        if col_btn.button("💾 Salva Sessione", use_container_width=True):
+
+            errori = []
+            if not nome_ins:    errori.append("Nome")
+            if not cognome_ins: errori.append("Cognome")
+            if not sede_ins:    errori.append("Sede")
+            if not data_s:      errori.append("Data")
+            if not dur_sel:
+                errori.append("Sessione (nessuna selezione)")
+            elif dur_sel == "Altro..." and not f_durata:
+                errori.append("Sessione (hai scelto 'Altro...' ma non hai specificato il valore)")
+            if not prg_sel:
+                errori.append("Programma (nessuna selezione)")
+            elif prg_sel == "Altro..." and not f_prog:
+                errori.append("Programma (hai scelto 'Altro...' ma non hai specificato il valore)")
+            if not liv_sel:
+                errori.append("Livello (nessuna selezione)")
+            elif liv_sel == "Altro..." and not f_liv:
+                errori.append("Livello (hai scelto 'Altro...' ma non hai specificato il valore)")
+            if not any([vel, dist, cal]):
+                errori.append("almeno un valore tra Km/h, Km, Calorie deve essere > 0")
+
+            if errori:
+                st.error(f"Compila i campi obbligatori: {', '.join(errori)}")
+            else:
+                with st.spinner("Salvataggio in corso..."):
+                    try:
+                        sheet = get_sheet()
+                        riga  = [
+                            sanifica(f"{nome_ins} {cognome_ins}"),
+                            sanifica(nome_ins),
+                            sanifica(cognome_ins),
+                            0, "",
+                            data_s.strftime("%d/%m/%Y"),
+                            sanifica(f_durata),
+                            sanifica(f_prog),
+                            sanifica(f_liv),
+                            _nv(vel), _nv(dist), _nv(cal),
+                            sanifica(sede_ins),
+                            0, 0, 0, _nv(temp), sanifica(note_ins)
+                        ]
+                        ok = _retry(sheet.append_row, riga)
+                        if ok:
+                            fetch_all_data.clear()
+                            invalida_df_cache()
+                            st.session_state.form_id += 1
+                            st.success("✅ Sessione salvata correttamente!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Salvataggio fallito dopo 3 tentativi.")
+                    except Exception as e:
+                        logger.error("Errore salvataggio: %s", e)
+                        st.error(f"Errore durante il salvataggio: {e}")
+
+    # ── 5. ARCHIVIO RECENTE E CANCELLAZIONE ─────────────────────────────
+    st.divider()
+    st.subheader("📊 Archivio Recente (30gg)")
+
+    if dati_raw:
+        c_data_g = get_exact_col(df_norm.columns, "DATA")
+
+        if c_data_g:
+            df_glob = df_norm.copy()
+            df_glob[c_data_g] = pd.to_datetime(df_glob[c_data_g], dayfirst=True, errors="coerce")
+            limite     = datetime.now() - timedelta(days=30)
+            df_recenti = df_glob[df_glob[c_data_g] >= limite].copy().sort_values(c_data_g, ascending=False)
+
+            if not df_recenti.empty:
+                df_rec_disp = filtra_privacy(df_recenti).copy()
+                df_rec_disp[c_data_g] = df_rec_disp[c_data_g].dt.strftime("%d/%m/%Y")
+                st.dataframe(df_rec_disp, use_container_width=True)
+
+                # ── MODIFICA RIGA ─────────────────────────────────────────
+                with st.expander("✏️ Modifica una riga dall'archivio"):
+                    righe_mod = [
+                        {
+                            "label":      f"{r[c_data_g].strftime('%d/%m/%Y')} — {r['Nome']} {r['Cognome']}",
+                            "row_number": r["GOOGLE_SHEET_ROW"],
+                        }
+                        for _, r in df_recenti.iterrows()
+                    ]
+
+                    mod_idx = st.selectbox(
+                        "Seleziona la sessione da modificare:",
+                        range(len(righe_mod)),
+                        format_func=lambda i: righe_mod[i]["label"],
+                        index=None,
+                        key="sel_modifica"
+                    )
+
+                    if mod_idx is not None:
+                        row_number_mod = righe_mod[mod_idx]["row_number"]
+                        rows_list      = list(df_recenti.iterrows())
+                        _, r_cur       = rows_list[mod_idx]
+                        cols_rec       = df_recenti.columns.tolist()
+
+                        c_kmh_m  = get_exact_col(cols_rec, "KMH")
+                        c_km_m   = get_exact_col(cols_rec, "KM")
+                        c_cal_m  = get_exact_col(cols_rec, "CALORIE")
+                        c_prog_m = get_exact_col(cols_rec, "PROGRAMMA")
+                        c_liv_m  = get_exact_col(cols_rec, "LIVELLO")
+                        c_temp_m = get_exact_col(cols_rec, "TEMP")
+                        c_note_m = next((c for c in cols_rec if str(c).strip().upper() == "NOTE"), None)
+                        c_sede_m = next((c for c in cols_rec if "SEDE" in str(c).upper()), None)
+                        c_sess_m = next((c for c in cols_rec
+                                         if "SESS" in str(c).upper() or "DUR" in str(c).upper()), None)
+
+                        cur_nome    = str(r_cur.get("Nome",    ""))
+                        cur_cognome = str(r_cur.get("Cognome", ""))
+                        cur_sede    = str(r_cur.get(c_sede_m,  "")) if c_sede_m else "Prati"
+                        cur_data_s  = str(r_cur.get(c_data_g,  ""))
+                        cur_sess    = str(r_cur.get(c_sess_m,  "")) if c_sess_m else ""
+                        cur_prog    = str(r_cur.get(c_prog_m,  "")) if c_prog_m else ""
+                        cur_liv     = str(r_cur.get(c_liv_m,   "")) if c_liv_m  else ""
+                        cur_kmh     = str(r_cur.get(c_kmh_m,   "")) if c_kmh_m  else ""
+                        cur_km      = str(r_cur.get(c_km_m,    "")) if c_km_m   else ""
+                        cur_cal     = str(r_cur.get(c_cal_m,   "")) if c_cal_m  else ""
+                        cur_temp    = str(r_cur.get(c_temp_m,  "")) if c_temp_m else ""
+                        cur_note    = str(r_cur.get(c_note_m,  "")) if c_note_m else ""
+
+                        try:
+                            cur_date_val = datetime.strptime(cur_data_s.strip(), "%d/%m/%Y").date()
+                        except ValueError:
+                            cur_date_val = datetime.today().date()
+
+                        st.info(f"Stai modificando: **{cur_nome} {cur_cognome}** — {cur_data_s}")
+
+                        with st.container(border=True):
+                            st.markdown("**Modifica i campi che vuoi aggiornare, poi clicca Salva Modifiche.**")
+
+                            m1, m2, m3 = st.columns(3)
+                            mod_nome    = m1.text_input("Nome *",    value=cur_nome,    key="mod_nome",    max_chars=MAX_INPUT_LEN)
+                            mod_cognome = m2.text_input("Cognome *", value=cur_cognome, key="mod_cognome", max_chars=MAX_INPUT_LEN)
+                            sedi_list   = ["Prati", "Corso Trieste"]
+                            mod_sede    = m3.selectbox(
+                                "Sede *", sedi_list,
+                                index=sedi_list.index(cur_sede) if cur_sede in sedi_list else 0,
+                                key="mod_sede"
+                            )
+
+                            md1, md2 = st.columns(2)
+                            mod_data = md1.date_input("Data *", value=cur_date_val,
+                                                      format="DD/MM/YYYY", key="mod_data")
+                            mod_sess = md2.text_input("Sessione", value=cur_sess,
+                                                      key="mod_sess", max_chars=MAX_INPUT_LEN)
+
+                            mp1, mp2 = st.columns(2)
+                            mod_prog = mp1.text_input("Programma", value=cur_prog,
+                                                      key="mod_prog", max_chars=MAX_INPUT_LEN)
+                            mod_liv  = mp2.text_input("Livello",   value=cur_liv,
+                                                      key="mod_liv",  max_chars=MAX_INPUT_LEN)
+
+                            mn1, mn2, mn3, mn4 = st.columns(4)
+                            mod_kmh  = mn1.text_input("Km/h",              value=cur_kmh,  key="mod_kmh")
+                            mod_km   = mn2.text_input("Km",                value=cur_km,   key="mod_km")
+                            mod_cal  = mn3.text_input("Calorie",           value=cur_cal,  key="mod_cal")
+                            mod_temp = mn4.text_input("Temp. Acqua (C)",  value=cur_temp, key="mod_temp")
+
+                            mod_note = st.text_area("Note", value=cur_note,
+                                                    key="mod_note", max_chars=256)
+
+                            col_salva_m, col_ann_m = st.columns(2)
+                            if col_salva_m.button("💾 Salva Modifiche", use_container_width=True,
+                                                  key="btn_mod_salva"):
+                                errori_m = []
+                                if not mod_nome:    errori_m.append("Nome")
+                                if not mod_cognome: errori_m.append("Cognome")
+                                if not any([(mod_kmh or "").strip(),
+                                            (mod_km  or "").strip(),
+                                            (mod_cal or "").strip()]):
+                                    errori_m.append("almeno un valore tra Km/h, Km, Calorie")
+
+                                if errori_m:
+                                    st.error(f"Compila i campi obbligatori: {', '.join(errori_m)}")
+                                else:
+                                    with st.spinner("Salvataggio modifiche in corso..."):
+                                        try:
+                                            sheet_m = get_sheet()
+                                            orig    = sheet_m.row_values(row_number_mod)
+                                            while len(orig) < 18:
+                                                orig.append("")
+
+                                            updated_row = [
+                                                sanifica(f"{mod_nome} {mod_cognome}"),        # A
+                                                sanifica(mod_nome),                           # B
+                                                sanifica(mod_cognome),                        # C
+                                                orig[3],                                      # D (preservato)
+                                                orig[4],                                      # E (preservato)
+                                                mod_data.strftime("%d/%m/%Y"),                # F
+                                                sanifica(mod_sess),                           # G
+                                                sanifica(mod_prog),                           # H
+                                                sanifica(mod_liv),                            # I
+                                                _nv(mod_kmh), _nv(mod_km), _nv(mod_cal),     # J K L
+                                                sanifica(mod_sede),                           # M
+                                                orig[13],                                     # N (preservato)
+                                                orig[14],                                     # O (preservato)
+                                                orig[15],                                     # P (preservato)
+                                                _nv(mod_temp),                                # Q
+                                                sanifica(mod_note),                           # R
+                                            ]
+
+                                            ok = _retry(
+                                                sheet_m.update,
+                                                f"A{row_number_mod}:R{row_number_mod}",
+                                                [updated_row]
+                                            )
+                                            if ok:
+                                                del st.session_state["sel_modifica"]
+                                                fetch_all_data.clear()
+                                                invalida_df_cache()
+                                                st.success("✅ Riga modificata correttamente!")
+                                                st.rerun()
+                                            else:
+                                                st.error("❌ Modifica fallita. Riprova.")
+                                        except Exception as e:
+                                            logger.error("Errore modifica riga: %s", e)
+                                            st.error(f"Errore durante la modifica: {e}")
+
+                            if col_ann_m.button("❌ Annulla", use_container_width=True,
+                                                key="btn_mod_ann"):
+                                del st.session_state["sel_modifica"]
+                                st.rerun()
+
+                # ── CANCELLA RIGA ─────────────────────────────────────────
+                with st.expander("🗑️ Cancella una riga dall'archivio"):
+                    opzioni = [
+                        {
+                            "label":      f"{r[c_data_g].strftime('%d/%m/%Y')} — {r['Nome']} {r['Cognome']}",
+                            "row_number":  r["GOOGLE_SHEET_ROW"],
+                        }
+                        for _, r in df_recenti.iterrows()
+                    ]
+
+                    scelta_idx = st.selectbox(
+                        "Seleziona la sessione da eliminare:",
+                        range(len(opzioni)),
+                        format_func=lambda i: opzioni[i]["label"],
+                        index=None,
+                        key="sel_cancella"
+                    )
+
+                    if scelta_idx is not None:
+                        scelta = opzioni[scelta_idx]
+                        st.warning(
+                            f"⚠️ Stai per eliminare: **{scelta['label']}**. "
+                            "Questa azione è irreversibile."
+                        )
+                        col_si, col_no = st.columns(2)
+                        if col_si.button("✅ Sì, elimina", use_container_width=True):
+                            with st.spinner("Eliminazione in corso..."):
+                                sheet = get_sheet()
+                                ok = _retry(sheet.delete_rows, scelta["row_number"])
+                                if ok:
+                                    del st.session_state["sel_cancella"]
+                                    invalida_df_cache()
+                                    fetch_all_data.clear()
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Eliminazione fallita.")
+                        if col_no.button("❌ Annulla", use_container_width=True):
+                            del st.session_state["sel_cancella"]
+                            st.rerun()
 
 except Exception as e:
-    st.error(f"Errore nel caricamento: {e}")
-    st.info("Assicurati di aver 'Pubblicato sul Web' il file come CSV.")
+    logger.error("Errore generale: %s", e)
+    st.error(f"Errore generale: {e}")
